@@ -1,4 +1,5 @@
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth')();
 const fs = require('fs');
 const path = require('path');
 const cors = require('@koa/cors');
@@ -6,6 +7,8 @@ const URL = require('url').URL;
 const axios = require('axios');
 const os = require('os');
 const logger = require('koa-morgan'); // Koa-compatible morgan logger
+
+chromium.use(stealth);
 
 const validateUrl = (url) => {
   try {
@@ -35,22 +38,29 @@ const startBrowser = async () => {
 
 // Utility function to download assets (JS, CSS, Images)
 const downloadAsset = async (assetUrl, baseUrl) => {
-  const fileUrl = new URL(assetUrl, baseUrl);
-  const filePath = path.join(os.tmpdir(), path.basename(fileUrl.pathname)); // Save in system's temp directory
+  try {
+    const fileUrl = new URL(assetUrl.trim(), baseUrl); // Trim spaces
+    if (!fileUrl.pathname) return null; // Skip invalid URLs
 
-  // Check if the file exists, if not download it
-  if (!fs.existsSync(filePath)) {
-    const response = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
-    fs.writeFileSync(filePath, response.data);
+    const filePath = path.join(os.tmpdir(), path.basename(fileUrl.pathname));
+
+    if (!fs.existsSync(filePath)) {
+      const response = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
+      fs.writeFileSync(filePath, response.data);
+    }
+
+    return filePath;
+  } catch (error) {
+    console.error(`❌ Failed to download asset: ${assetUrl}`, error.message);
+    return null; // Skip invalid assets
   }
-
-  return filePath;
 };
 
 // Rewrite asset URLs in the HTML content
 const rewriteUrlsInContent = (content, baseUrl) => {
+  content = content.replace(/\s+srcset="[^"]*"/g, '');
+
   return content.replace(/(["' ])(\/[^"'>]+)/g, (match, quote, relativeUrl) => {
-    // Convert relative URLs to the local server path (e.g., replace with local paths)
     return `${quote}${baseUrl}${relativeUrl}`;
   });
 };
@@ -131,11 +141,20 @@ const handler = async (ctx) => {
     // Serve the content with asset links updated
     content = await rewriteUrlsInContent(content, '/assets/'); // Rewriting the base URL to local '/assets/'
 
+    // Inject the script to disable console errors in the client
+    content += `<script>
+      window.console.log = function() {};
+      window.console.warn = function() {};
+      window.console.error = function() {};
+      window.onerror = function() { return true; };
+      window.addEventListener('error', function(e) { e.stopImmediatePropagation(); e.preventDefault(); return false; }, true);
+      window.addEventListener('unhandledrejection', function(e) { e.preventDefault(); }, true);
+    </script>`;
+
     await page.close();
     ctx.body = content;
     ctx.status = 200;
   } catch (error) {
-    console.error('❌ Error fetching page:', error);
     ctx.status = 500;
     ctx.body = { status: 'error', message: 'Failed to load page through proxy', details: error.message };
   }
